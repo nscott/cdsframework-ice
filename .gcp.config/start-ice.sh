@@ -4,7 +4,7 @@ if [[ -v DEBUG ]]; then
     echo "DEBUG is set to: $DEBUG"
     if [ "$DEBUG" == "Y" ]; then
         echo "Turning debug on..."
-        sed -i 's/info/debug/' /usr/local/tomcat/webapps/opencds-decision-support-service/WEB-INF/classes/log4j.xml
+        sed -i 's/info/debug/' /usr/local/tomcat/webapps/opencds-decision-support-service/WEB-INF/classes/log4j2.xml
     fi
 fi
 
