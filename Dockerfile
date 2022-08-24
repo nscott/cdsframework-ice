@@ -12,9 +12,9 @@ WORKDIR ${HOME}
 # Maven may choke if it can't consume outrageous amounts of memory.
 ENV MAVEN_OPTS="-Xmx16G"
 
-ADD opencds/opencds-knowledge-repository-data/pom.xml ${HOME}/opencds/opencds-knowledge-repository-data/pom.xml 
-RUN cd opencds/opencds-knowledge-repository-data && mvn clean
-RUN cd opencds/opencds-knowledge-repository-data && mvn dependency:go-offline
+ADD opencds/opencds-knowledge-repository-data/pom.xml ${HOME}/opencds/opencds-knowledge-repository-data/pom.xml
+RUN cd opencds/opencds-knowledge-repository-data && mvn -B dependency:go-offline
+RUN cd opencds/opencds-knowledge-repository-data && mvn -B dependency:resolve-plugins
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -96,8 +96,8 @@ ADD rules-packager/pom.xml ${HOME}/rules-packager/pom.xml
 # We separate the clean and copy-deps steps to allow mvn clean to be cached for multiple runs.
 # --fail-never is used since certain dependencies WILL fail, since they aren't yet built. That's okay.
 # We just want to resolve as much as we can.
-RUN cd opencds/opencds-parent && mvn clean
-RUN cd opencds/opencds-parent && mvn -DskipTests -DskipITs --fail-never dependency:go-offline
+RUN cd opencds/opencds-parent && mvn -B -DskipTests --fail-never dependency:go-offline
+RUN cd opencds/opencds-parent && mvn -B -DskipTests --fail-never dependency:resolve-plugins
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -122,7 +122,6 @@ COPY ./opencds-support-client opencds-support-client
 COPY ./cdsframework-support-xml cdsframework-support-xml
 COPY ./ice3 ice3
 COPY ./opencds-rest-service opencds-rest-service
-COPY ./rules-packager rules-packager
 COPY ./LICENSE-header.txt ./LICENSE-header.txt
 # opencds-ice-service fails without a git directory which is weird
 COPY ./.git .git
@@ -131,8 +130,36 @@ COPY ./.git .git
 # Go figure. We can't use offline mode (-o) since there are some plugins and things that are out-of-band from the
 # dependency:go-offline command. Allow things to install naturally here. Still way after than tightly coupling
 # MOST of the dependency downloads to this build step.
-RUN cd opencds/opencds-knowledge-repository-data && mvn install
-RUN cd opencds/opencds-parent && mvn -e -DskipTests -DskipITs install
+
+# Data
+RUN cd opencds/opencds-knowledge-repository-data && mvn -B -Dmaven.compiler.source=1.7 -Dmaven.compiler.target=1.7 install
+# Main. We compile some of the smaller sub-project parents one-at-a-time, which increases single build time (multiple mvn launches)
+# but leads to a more consistently passing build. Sometimes maven just hangs when trying to build the entire project.
+# The project order was generated based on the reactor build order, which you can see with `mvn validate`.
+# This isn't exhaustive - just some of the independent leaves. There still has to be a final complete build.
+RUN cd opencds/opencds-parent/opencds-common && \
+    mvn -B -P drools-7 -DskipTests -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 install
+
+RUN cd opencds/opencds-parent/opencds-config && \
+    mvn -B -P drools-7 -DskipTests -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 install
+
+RUN cd opencds/opencds-parent/dss-java-stub && \
+    mvn -B -P drools-7 -DskipTests -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 install
+
+RUN cd opencds-support-client && \
+    mvn -B -P drools-7 -DskipTests -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 install
+
+RUN cd cdsframework-support-xml && \
+    mvn -B -P drools-7 -DskipTests -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 install
+
+# Finally build the entire parent project since all the targets for most children should be built.
+RUN cd opencds/opencds-parent && mvn -B -P drools-7 -DskipTests -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 install
+
+# Rules packager. This isn't stricly needed but it's nice that it's here and it works.
+COPY ./rules-packager rules-packager
+RUN cd rules-packager && mvn -B -Dmaven.compiler.source=1.8 -Dmaven.compiler.target=1.8 compile assembly:single install
+# Package the rules
+RUN mvn -f ./rules-packager exec:exec -Dexec.executable=java -Dexec.args="-cp %classpath org.cdsframework.rules.packager.Packager ./ice-gen.properties gov.nyc.cir^ICE^1.0.0 org.cdsframework^ICE^1.0.0"
 
 # Forces the container to stay up for debugging usage
 ENTRYPOINT ["tail", "-f", "/dev/null"]
@@ -167,14 +194,14 @@ WORKDIR /home/appuser
 
 RUN mkdir -p /usr/local/projects/ice/ice3/opencds-ice-service/src/main/resources
 
-# copy config files
+# Copy over the service
 COPY --from=compile /var/opt/opencds-build/opencds/opencds-parent/opencds-decision-support-service/target/opencds-decision-support-service-2.0.5 \
         /usr/local/tomcat/webapps/opencds-decision-support-service
-COPY --from=compile /var/opt/opencds-build/ice3 /usr/local/projects/ice/
+
 COPY --from=compile /var/opt/opencds-build/ice3/opencds-ice-service/src/main/resources \
         /usr/local/tomcat/webapps/opencds-decision-support-service/opencds-ice-service/src/main/resources
-COPY --from=compile /var/opt/opencds-build/ice3/opencds-ice-service /usr/local/projects/ice/
 
+# TODO: There should probably be a `docker/` folder that has specific build settings instead of using whatever is used for GCP.
 COPY .gcp.config/opencds.properties .opencds
 COPY .gcp.config/sec.xml .opencds
 COPY .gcp.config/log4j2.xml /usr/local/tomcat/webapps/opencds-decision-support-service/WEB-INF/classes
@@ -186,5 +213,7 @@ RUN chown -R appuser: /home/appuser /usr/local/tomcat
 
 USER appuser
 
-# Run Tomcat server
-CMD ["./start-ice.sh", "catalina.sh", "run"]
+# Run the tomcat server. We have to launch inside of bash because running the shell script directly has weird IO issues.
+# It's likely the lack of output reading when there's no tty created (i.e. non-interactive mode).
+CMD ["/bin/bash", "-c", "./start-ice.sh catalina.sh run"]
+
